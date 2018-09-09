@@ -269,7 +269,7 @@ CONTAINS
 
     ! Turn heterogeneous chemistry and photolysis on/off here
     ! This is for testing only and may be removed later (mps, 4/26/16)
-    DO_HETCHEM  = .TRUE.
+    DO_HETCHEM  = .FALSE.
 
     ! Remove debug output
     !IF ( FIRSTCHEM .AND. am_I_Root ) THEN
