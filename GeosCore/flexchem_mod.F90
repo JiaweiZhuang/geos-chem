@@ -15,6 +15,10 @@ MODULE FlexChem_Mod
 ! !USES:
 !
   USE Precision_Mod            ! For GEOS-Chem Precision (fp)
+  
+  ! KPP-branch specific
+  USE netcdf  ! Use low-level NC library to save KPP-related fields
+              ! Need to import in Module-level to use in multiple subroutines
 
   IMPLICIT NONE
   PRIVATE
@@ -97,6 +101,7 @@ CONTAINS
 !
 ! !USES:
 !
+  
     USE AEROSOL_MOD,          ONLY : SOILDUST, AEROSOL_CONC, RDAER
     USE CMN_FJX_MOD
     USE CMN_SIZE_MOD,         ONLY : IIPAR, JJPAR, LLPAR
@@ -207,6 +212,44 @@ CONTAINS
 !
 ! !LOCAL VARIABLES:
 !
+
+    ! ---- KPP-branch specific variables ---
+    
+    ! for making NetCDF file 
+    character (len = *), parameter :: KPP_FILE_NAME = "./KPP_fields.nc"
+    integer :: kpp_ncid ! file ID
+    integer :: x_dimid, y_dimid, z_dimid ! spatial dimension ID
+    integer :: nspec_dimid, nreact_dimid, nphotol_dimid, nphy_dimid ! extra dim ID
+    integer :: dimids(4) ! placeholder for multiple dimensions
+    integer :: c_before_varid, c_after_varid ! species ID
+    integer :: photol_varid, phy_varid, rconst_varid ! other variables ID
+    
+    ! record KPP-related fields
+    
+    ! species concontrations
+    REAL(fp) :: KPP_C_before(NSPEC, IIPAR, JJPAR, LLPAR)  ! C(NSPEC) before KPP integrate
+    REAL(fp) :: KPP_C_after(NSPEC, IIPAR, JJPAR, LLPAR)  ! C(NSPEC) after KPP integrate
+    
+    ! Photolysis rates; JVN_=130 is defined in Headers/CMN_FJX_MOD.F
+    REAL(fp) :: KPP_PHOTOL(JVN_, IIPAR, JJPAR, LLPAR)  ! PHOTOL(1:JVN_)
+    
+    ! Physical fields 
+    REAL(fp) :: KPP_PHY(4, IIPAR, JJPAR, LLPAR) ! [TEMP, PRESS, NUMDEN, H2O]
+    
+    ! All reaction rates. Mainly for double-check.
+    ! There are 3 categories (see gckpp_Rates.F90)
+    ! 1. Calculated from Physical fields 
+    ! 2. Copied from PHOTOL
+    ! 3. Heterogeneous reaction rates. (the only new information)
+    REAL(fp) :: KPP_RCONST(NREACT, IIPAR, JJPAR, LLPAR) ! RCONST(NREACT)
+    
+    ! Do not save the heterogeneous reaction rates: HET(NSPEC,7)
+    ! They can be retrieved from RCONST (see gckpp_Rates.F90)
+    ! Also, a size (NSPEC, 7, IIPAR, JJPAR, LLPAR) array is too large,
+    ! and most of elements are 0
+
+    ! --- end declaration of KPP-branch specific variables ---
+
     ! Scalars
     LOGICAL                :: prtDebug,  IsLocNoon
     INTEGER                :: I,         J,        L,         N
@@ -902,9 +945,45 @@ CONTAINS
 !         CALL CPU_TIME( start )
 !#endif
 
+       ! ---- KPP-branch specific ---- 
+       
+       ! Record KPP's state vector after it is fully initialized.
+       ! Put this recording code as close to CALL Integrate() as
+       ! as possible, to get exactly what KPP sees.
+       ! (j.w.z)
+       
+       ! Follow KPP's internal species ordering, so it is easier 
+       ! to interface with the standalone KPP package.
+       ! Note that NSPEC is the fastest changing dimension
+       ! This is more memory-efficient, for both here and interacting
+       ! with the box model.
+       KPP_C_before(1:NSPEC,I,J,L) = C(1:NSPEC)
+       
+       ! Photolysis rates
+       KPP_PHOTOL(1:JVN_,I,J,L)=PHOTOL(1:JVN_) ! PHOTOL(JVN_+1:1000) are all zero
+       
+       ! Physical fields
+       KPP_PHY(1,I,J,L)=TEMP
+       KPP_PHY(2,I,J,L)=PRESS
+       KPP_PHY(3,I,J,L)=NUMDEN
+       KPP_PHY(4,I,J,L)=H2O
+       
+       ! All reaction rates
+       ! Note that Update_RCONST( ) is already called above
+       KPP_RCONST(1:NREACT,I,J,L) = RCONST(1:NREACT)
+       
+       !  ---- end KPP-branch specific code ---- 
+
        ! Call the KPP integrator
        CALL Integrate( TIN,    TOUT,    ICNTRL,      &
                        RCNTRL, ISTATUS, RSTATE, IERR )
+                       
+       ! Record species concentration immediately after integration
+       ! (KPP-branch specific)
+       KPP_C_after(1:NVAR,I,J,L) = VAR(1:NVAR)
+       KPP_C_after(NVAR+1:NSPEC,I,J,L) = FIX(:)
+       ! Cannot use KPP_C_after(1:NSPEC,I,J,L) = C(1:NSPEC),
+       ! because EQUIVALENT statement for (VAR,FIX)<->C is not used in full GC
 
        ! Print grid box indices to screen if integrate failed
        IF ( IERR < 0 ) THEN
@@ -1232,6 +1311,59 @@ CONTAINS
 
     ! Set FIRSTCHEM = .FALSE. -- we have gone thru one chem step
     FIRSTCHEM = .FALSE.
+    
+    ! ----------------------------------------
+    ! Start writing KPP-branch specific fields
+    ! ----------------------------------------
+    
+    WRITE (6,*) 'Start writing KPP fields into NetCDF file:', KPP_FILE_NAME
+    
+    WRITE (6,*) '- Create NetCDF file'
+    call check_nc( nf90_create(KPP_FILE_NAME, NF90_CLOBBER, kpp_ncid) )
+    
+    WRITE (6,*) '- define spatial dimensions'
+    call check_nc( nf90_def_dim(kpp_ncid, "lon", IIPAR, x_dimid) )
+    call check_nc( nf90_def_dim(kpp_ncid, "lat", JJPAR, y_dimid) )
+    call check_nc( nf90_def_dim(kpp_ncid, "lev", LLPAR, z_dimid) )
+    
+    WRITE (6,*) '- define variable dimensions'
+    call check_nc( nf90_def_dim(kpp_ncid, "nspec", NSPEC, nspec_dimid) )
+    call check_nc( nf90_def_dim(kpp_ncid, "nphy", 4, nphy_dimid) )
+    call check_nc( nf90_def_dim(kpp_ncid, "nphotol", JVN_, nphotol_dimid) )
+    call check_nc( nf90_def_dim(kpp_ncid, "nreact", NREACT, nreact_dimid) )
+    
+    WRITE (6,*) '- define variables'
+    dimids =  (/nspec_dimid, x_dimid, y_dimid, z_dimid/) 
+    call check_nc( nf90_def_var(kpp_ncid, "C_before", NF90_DOUBLE, dimids, c_before_varid) )
+    call check_nc( nf90_def_var(kpp_ncid, "C_after", NF90_DOUBLE, dimids, c_after_varid) )
+    
+    dimids =  (/nphotol_dimid, x_dimid, y_dimid, z_dimid/) 
+    call check_nc( nf90_def_var(kpp_ncid, "PHOTOL", NF90_DOUBLE, dimids, photol_varid) )
+    
+    dimids =  (/nphy_dimid, x_dimid, y_dimid, z_dimid/) 
+    call check_nc( nf90_def_var(kpp_ncid, "PHY", NF90_DOUBLE, dimids, phy_varid) )
+    
+    dimids =  (/nreact_dimid, x_dimid, y_dimid, z_dimid/) 
+    call check_nc( nf90_def_var(kpp_ncid, "RCONST", NF90_DOUBLE, dimids, rconst_varid) )
+    
+    ! Tells netCDF we are done defining metadata.
+    call check_nc( nf90_enddef(kpp_ncid) ) 
+    
+    ! write actual data
+    WRITE (6,*) '- write data'
+    call check_nc( nf90_put_var(kpp_ncid, c_before_varid, KPP_C_before) ) 
+    call check_nc( nf90_put_var(kpp_ncid, c_after_varid, KPP_C_after) ) 
+    call check_nc( nf90_put_var(kpp_ncid, photol_varid, KPP_PHOTOL) ) 
+    call check_nc( nf90_put_var(kpp_ncid, phy_varid, KPP_PHY) ) 
+    call check_nc( nf90_put_var(kpp_ncid, rconst_varid, KPP_RCONST) ) 
+    
+    ! Finish
+     WRITE (6,*) '- close file'
+    call check_nc( nf90_close(kpp_ncid) )
+    
+    ! ----------------------------------------
+    ! end of writing KPP fields
+    ! ----------------------------------------
 
   END SUBROUTINE Do_FlexChem
 !EOC
@@ -1719,4 +1851,15 @@ CONTAINS
 
   END SUBROUTINE Cleanup_FlexChem
 !EOC
+!------------------------------------------------------------------------------
+!                  FOR CUSTOM NETCDF OUTPUT  (KPP-branch) !
+!------------------------------------------------------------------------------
+  subroutine check_nc(status)
+    integer, intent ( in) :: status
+    
+    if(status /= nf90_noerr) then 
+      print *, trim(nf90_strerror(status))
+      stop "Stopped"
+    end if
+  end subroutine check_nc  
 END MODULE FlexChem_Mod
