@@ -216,7 +216,8 @@ CONTAINS
     ! ---- KPP-branch specific variables ---
     
     ! for making NetCDF file 
-    character (len = *), parameter :: KPP_FILE_NAME = "./KPP_fields.nc"
+    integer, save :: kpp_counter = 0 ! count how many time KPP is called
+    character (len = 100) :: KPP_FILE_NAME ! output file name
     integer :: kpp_ncid ! file ID
     integer :: x_dimid, y_dimid, z_dimid ! spatial dimension ID
     integer :: nspec_dimid, nreact_dimid, nphotol_dimid, nphy_dimid ! extra dim ID
@@ -1316,10 +1317,13 @@ CONTAINS
     ! Start writing KPP-branch specific fields
     ! ----------------------------------------
     
-    WRITE (6,*) 'Start writing KPP fields into NetCDF file:', KPP_FILE_NAME
+    kpp_counter = kpp_counter + 1
+    write (KPP_FILE_NAME, "(A13,I0.3,A3)") "./KPP_fields_", kpp_counter, ".nc"
+    
+    WRITE (6,*) 'Start writing KPP fields into NetCDF file:', trim(KPP_FILE_NAME)
     
     WRITE (6,*) '- Create NetCDF file'
-    call check_nc( nf90_create(KPP_FILE_NAME, NF90_CLOBBER, kpp_ncid) )
+    call check_nc( nf90_create(trim(KPP_FILE_NAME), NF90_CLOBBER, kpp_ncid) )
     
     WRITE (6,*) '- define spatial dimensions'
     call check_nc( nf90_def_dim(kpp_ncid, "lon", IIPAR, x_dimid) )
